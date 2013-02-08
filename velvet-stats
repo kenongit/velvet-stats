@@ -1,0 +1,213 @@
+#!/usr/bin/env python
+
+import sys, os
+import optparse
+import logging
+import csv
+
+p = optparse.OptionParser()
+
+p.add_option("-o", "--output", dest = "output_fn", metavar = "FILENAME",
+	help = "(mandatory) destination of the .csv-formatted report")
+
+p.add_option("-v", "--verbose", dest = "verbose", action = "store_true", default = False,
+	help = "(optional) if set, will display debug information")
+
+(p, a) = p.parse_args()
+
+log_formatter = logging.Formatter("[%(asctime)s] %(name)s: %(levelname)s: %(message)s")
+log_handler = logging.StreamHandler()
+log_handler.setFormatter(log_formatter)
+
+logger = logging.getLogger(os.path.basename(__file__))
+logger.addHandler(log_handler)
+
+if (p.verbose):
+	logger.setLevel(logging.DEBUG)
+else:
+	logger.setLevel(logging.INFO)
+
+def error (msg):
+	logger.error(msg)
+	sys.exit(1)
+
+if (p.output_fn == None):
+	error("no output file has been provided")
+
+if (len(a) == 0):
+	error("no Velvet output directory has been provided")
+
+outdirs = []
+for fn in a:
+	if (not os.path.isdir(fn)):
+		logger.warning("entry '%s' is not a directory and will be ignored" % fn)
+		continue
+
+	fn = os.path.abspath(fn)
+
+	if (fn in outdirs):
+		logger.warning("duplicate entry '%s'" % fn)
+		continue
+
+	outdirs.append(fn)
+	logger.debug("added '%s' to list of candidate outdirs" % fn)
+
+#:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+try:
+	from Bio import SeqIO
+except:
+	error("unable to use the Biopython library")
+
+def parse_roadmaps (fn, scores):
+	i = open(fn, 'rU')
+	header = i.readline()
+	i.close()
+
+	tokens = header.split()
+	return (
+		("kmer_length", int(tokens[2])),
+	)
+
+def parse_contigs_fa (fn, scores):
+	n_sequences = 0
+	n_bases, n_N = 0, 0
+	lengths = []
+
+	for entry in SeqIO.parse(fn, "fasta"):
+		n_sequences += 1
+		n_bases += len(entry.seq)
+		n_N += str(entry.seq).upper().count('N')
+		lengths.append(len(entry.seq))
+
+	def N50 (lengths):
+		"""	Calculate the N50 length; at least half the nucleotides in
+			the assembly belong to contigs of this length or longer.
+			See https://www.broad.harvard.edu/crd/wiki/index.php/N50
+		"""
+		m = sum(lengths) / 2.0
+		t, n50 = 0, 0
+		for l in reversed(sorted(lengths)):
+			t += l
+			if (t > m):
+				n50 = l
+				break
+		return n50
+
+	return (
+		("n_sequences", n_sequences),
+		("n_long_sequences", len(filter(lambda x: x >= 1000, lengths))),
+		("n_short_sequences", len(filter(lambda x: x < 1000, lengths))),
+		("n_bases", n_bases),
+		("n_N", n_N),
+		("n_non_N", n_bases - n_N),
+		("min_length", min(lengths)),
+		("max_length", max(lengths)),
+		("avg_length", sum(lengths) / float(n_sequences)),
+		("N50", N50(lengths)),
+	)
+
+def parse_stats_txt (fn, scores):
+	assert ("kmer_length" in scores)
+
+	# based on estExpCov in VelvetOptimiser
+	min_length = 3 * scores["kmer_length"] - 1
+	min_cov = 3
+
+	cov_keys = ("short1_cov", "short2_cov")
+	inf = float("Inf")
+
+	covs = []
+	for entry in csv.DictReader(open(fn, 'rU'), delimiter = '\t'):
+		l = int(entry["lgth"])
+		if (l < min_length):
+			continue
+
+		# summation of all the short_cov* columns
+		cov = sum([float(entry[cov_key]) for cov_key in cov_keys])
+		if (cov < min_cov) or (cov == inf):
+			continue
+
+		covs.append(int(cov * l))
+
+	# find the mode of covs
+	freq = {}
+	for value in covs:
+		if (not value in freq):
+			freq[value] = 0
+
+		freq[value] += 1
+
+	mode_f, mode_v = 0, None
+	for value, count in freq.iteritems():
+		if (count > mode_f):
+			mode_f = count
+			mode_v = value
+
+	return (
+		("exp_cov", mode_v),
+	)
+
+wanted_files = (
+	("Roadmaps", parse_roadmaps), # velveth
+	("contigs.fa", parse_contigs_fa), # velvetg
+	("stats.txt", parse_stats_txt), # velvetg
+)
+
+outdirs_ = []
+for outdir in outdirs:
+	keep = True
+
+	for (fn, parser) in wanted_files:
+		path = os.path.join(outdir, fn)
+
+		if (not os.path.exists(path)):
+			logger.warning("file '%s' not found in '%s'; this directory will be ignored" % (fn, os.path.relpath(outdir)))
+			keep = False
+			continue
+
+		if (os.path.getsize(path) == 0):
+			logger.warning("file '%s' empty in '%s'; this directory will be ignored" % (fn, os.path.relpath(outdir)))
+			keep = False
+			continue
+
+	if (keep):
+		outdirs_.append(outdir)
+
+outdirs = outdirs_
+
+if (len(outdirs) == 0):
+	error("no valid output directory to scan")
+
+logger.info("%s output director%s to scan" % (len(outdirs), {True: "ies", False: "y"}[len(outdirs) > 1]))
+
+#:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+keys, scores = [], {}
+for outdir in outdirs:
+	logger.info("begin scanning '%s'" % os.path.relpath(outdir))
+	scores[outdir] = {}
+
+	for (fn, parser) in wanted_files:
+		path = os.path.join(outdir, fn)
+		for key, value in parser(path, scores[outdir]):
+			scores[outdir][key] = value
+			if (not key in keys):
+				keys.append(key)
+
+	logger.info("done scanning '%s'" % os.path.relpath(outdir))
+
+logger.info("writing report in '%s'" % p.output_fn)
+
+o = csv.writer(open(p.output_fn, 'w'))
+o.writerow(keys + ["outdir"])
+
+for outdir in outdirs:
+	row = []
+	for key in keys:
+		row.append(scores[outdir].get(key, ''))
+
+	row.append(outdir)
+	o.writerow(row)
+
+logger.info("all done")
